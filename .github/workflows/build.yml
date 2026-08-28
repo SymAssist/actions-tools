@@ -3,6 +3,11 @@ name: Build and Push (Reusable)
 # Reusable build workflow: builds a Docker image, pushes it to ECR, and
 # publishes the resolved tag as an artifact and a workflow output.
 #
+# For dev push events (github.event_name == 'push'), the build is followed
+# by an automatic deploy to the dev environment via the deploy reusable
+# (see the `deploy` job below). Release events stop after the build — the
+# operator deploys the release tag manually via workflow_dispatch on deploy.yml.
+#
 # Callers pass all AWS and service-specific values as inputs; no
 # SymAssist-specific value is hardcoded here. The workflow is safe to
 # make public: it contains no account IDs, ARNs, or repo names.
@@ -51,6 +56,21 @@ on:
         required: false
         type: string
         default: Dockerfile
+
+      # Target passed to the automatic dev deploy. Selects which Terragrunt
+      # stacks to apply after a push to the dev branch.
+      # Defaults to backend-queue-worker (compute + queue-worker), the stacks
+      # that run the shared backend image. voiceai-ws also uses this image but
+      # is deployed explicitly via workflow_dispatch on deploy.yml when WS code
+      # changes warrant it. ai-service (compute-ai) uses a separate image and
+      # is never auto-deployed by the backend build.
+      auto_deploy_target:
+        description: >
+          Which service(s) the automatic dev deploy targets. Required: the
+          calling repository states what it deploys, since only it knows which
+          services run the image it just built.
+        required: true
+        type: string
 
     outputs:
       image_tag:
@@ -167,3 +187,31 @@ jobs:
           fi
           echo "- **Tag:** \`${{ steps.tag.outputs.TAG }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Registry:** \`${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # Automatic dev deploy: runs only when the caller was triggered by a push
+  # (dev branch). Release events stop after the build — the operator selects
+  # and deploys the release tag manually via workflow_dispatch on deploy.yml.
+  #
+  # Nesting depth: caller (level 0) -> build.yml (level 1) -> deploy.yml (level 2).
+  # GitHub Actions supports up to 4 levels of reusable workflow nesting (raised
+  # from 1 in October 2023). This chain uses 2 levels and is valid.
+  #
+  # A job with `uses:` cannot have `steps:` — this job has neither, only `uses:`,
+  # `needs:`, `if:`, `permissions:`, `with:`, and `secrets:`.
+  #
+  # Secret forwarding: `secrets: inherit` passes all secrets available in the
+  # current execution context (the caller's repo or org) to deploy.yml.
+  # INFRA_TOKEN must therefore be available to the caller — either as a
+  # repository secret in the service repo or as an organisation-level secret.
+  deploy:
+    needs: build-and-push
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/deploy.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      environment: dev
+      image_tag: ${{ needs.build-and-push.outputs.image_tag }}
+      target: ${{ inputs.auto_deploy_target }}
+    secrets: inherit
