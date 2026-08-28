@@ -106,6 +106,18 @@ jobs:
       image_tag: ${{ steps.tag.outputs.TAG }}
 
     steps:
+      # TEMPORARY: report whether the secret survived the hop from the caller.
+      # Prints only its length, never the value.
+      - name: Diagnose INFRA_TOKEN arrival
+        env:
+          T: ${{ secrets.INFRA_TOKEN }}
+        run: |
+          if [ -z "$T" ]; then
+            echo "DIAG: INFRA_TOKEN is EMPTY in the shared build"
+          else
+            echo "DIAG: INFRA_TOKEN arrived, length ${#T}"
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
 
