@@ -38,13 +38,10 @@ on:
         required: true
         type: string
 
-    secrets:
-      infra_token:
-        description: >
-          Token with read access to the infra repo (Braintly/infra).
-          Use a fine-grained PAT scoped to that repo only.
-          persist-credentials is false so the token does not leak into git config.
-        required: true
+    # INFRA_TOKEN is not declared here on purpose. Callers pass secrets with
+    # `inherit`, which carries them by their own name, and a manual dispatch
+    # reads it from this repository. Declaring it would force every caller in
+    # the chain to redeclare and forward it by hand.
 
   workflow_dispatch:
     inputs:
@@ -196,7 +193,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.INFRA_REPO }}
-          token: ${{ secrets.infra_token }}
+          token: ${{ secrets.INFRA_TOKEN }}
           path: infra
           persist-credentials: false
 
