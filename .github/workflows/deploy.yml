@@ -204,10 +204,15 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
+      # Installed straight from the release rather than through a third-party
+      # action: the version is pinned above, the download is two lines, and
+      # there is no action contract to keep up with.
       - name: Set up Terragrunt
-        uses: autero1/action-terragrunt@v3
-        with:
-          terragrunt_version: ${{ env.TG_VERSION }}
+        run: |
+          curl -fsSL -o /tmp/terragrunt \
+            "https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TG_VERSION }}/terragrunt_linux_amd64"
+          sudo install -m 0755 /tmp/terragrunt /usr/local/bin/terragrunt
+          terragrunt --version
 
       # Entry credentials only. The cross-account role is assumed by the
       # provider Terragrunt generates, so the role lives in one place — the
