@@ -1,0 +1,423 @@
+name: Deploy (Reusable)
+
+# Reusable deploy workflow: detects which Terragrunt stacks to apply, then
+# runs terragrunt apply for each in the correct order (max-parallel: 1).
+#
+# Design constraints:
+#   - Zero invocations of `aws` in any `run:` step. All AWS interaction goes
+#     through the aws-actions/configure-aws-credentials action. This was an
+#     explicit requirement from the project owner.
+#   - No SymAssist-specific value is hardcoded. Every account ID, ARN, repo
+#     name, infra path, and service-to-stack mapping is an input. This workflow
+#     can serve any service in any future organization.
+#   - The `trigger` input tells the workflow whether the caller was invoked by
+#     a workflow_run (auto dev deploy) or by workflow_dispatch/workflow_call
+#     (manual/orchestrated deploy). Inside a reusable workflow github.event_name
+#     is always "workflow_call", so the caller must forward its own event name.
+
+on:
+  workflow_call:
+    inputs:
+      # ── Routing ────────────────────────────────────────────────────────────
+      trigger:
+        description: >
+          The event name that triggered the calling workflow
+          (workflow_run | workflow_dispatch | workflow_call).
+          Required because github.event_name is always "workflow_call" inside
+          a reusable workflow; this input restores the original routing.
+        required: true
+        type: string
+
+      environment:
+        description: Target environment (dev | staging | prod)
+        required: true
+        type: string
+
+      image_tag:
+        description: >
+          Immutable image tag to deploy (e.g. v1.0.0 or dev-abc1234).
+          Leave empty when trigger is "workflow_run" — the tag is resolved from
+          the image-tag artifact uploaded by the build workflow.
+        required: false
+        type: string
+        default: ""
+
+      target:
+        description: >
+          Which service(s) to deploy. Must be a key in service_stack_map.
+          Ignored when trigger is "workflow_run" (stacks are path-detected).
+        required: false
+        type: string
+        default: all
+
+      # ── AWS / ECR ──────────────────────────────────────────────────────────
+      aws_region:
+        description: AWS region (e.g. us-east-1)
+        required: false
+        type: string
+        default: us-east-1
+
+      ecr_account_id:
+        description: AWS account ID that hosts the ECR registry
+        required: true
+        type: string
+
+      oidc_role_arn:
+        description: IAM role ARN to assume via OIDC as the entry point for credential chaining
+        required: true
+        type: string
+
+      ecr_repository:
+        description: ECR repository name (used in the step summary only)
+        required: true
+        type: string
+
+      # ── Infra repo ─────────────────────────────────────────────────────────
+      infra_repo:
+        description: >
+          GitHub repository that holds the Terragrunt configuration,
+          in "owner/repo" form (e.g. "my-org/infra").
+        required: true
+        type: string
+
+      infra_base_path:
+        description: >
+          Path prefix inside infra_repo that locates the service stacks.
+          The full working-directory for each stack is:
+            infra/<infra_base_path>/<environment>/<stack>
+          Example: "MyProduct" → infra/MyProduct/dev/compute
+        required: true
+        type: string
+
+      # ── Tool versions ──────────────────────────────────────────────────────
+      tf_version:
+        description: Terraform version to pin
+        required: false
+        type: string
+        default: "1.10.5"
+
+      tg_version:
+        description: Terragrunt version to pin
+        required: false
+        type: string
+        default: "0.93.5"
+
+      # ── Stack selection ────────────────────────────────────────────────────
+      # JSON object mapping target selector names to ordered arrays of
+      # Terragrunt stack directory names. The order within each array controls
+      # the apply sequence (max-parallel: 1 serialises the matrix).
+      # Example:
+      #   {
+      #     "backend-api":          ["compute"],
+      #     "backend-queue-worker": ["compute","queue-worker"],
+      #     "all":                  ["compute","queue-worker","voiceai-ws"]
+      #   }
+      service_stack_map:
+        description: JSON object mapping selector names to ordered stack arrays
+        required: true
+        type: string
+
+      # Auto-deploy stack arrays (used only when trigger == "workflow_run").
+      # These define which stacks to apply when changed-file path detection
+      # determines that only backend code, only worker code, or both changed.
+      # Leave empty if this service never uses the workflow_run trigger.
+      auto_backend_stacks:
+        description: JSON array of stacks when only backend paths changed (e.g. ["compute","queue-worker"])
+        required: false
+        type: string
+        default: "[]"
+
+      auto_worker_stacks:
+        description: JSON array of stacks when only worker paths changed (e.g. ["compute","voiceai-ws"])
+        required: false
+        type: string
+        default: "[]"
+
+      auto_both_stacks:
+        description: JSON array of stacks when both backend and worker paths changed
+        required: false
+        type: string
+        default: "[]"
+
+      # ── Path detection (workflow_run only) ─────────────────────────────────
+      # Extended-regex patterns (passed to grep -E) for changed-file detection
+      # in the auto dev deploy path. Leave empty if trigger is never workflow_run.
+      worker_path_pattern:
+        description: >
+          grep -E pattern matching files that belong to the worker service.
+          When any changed file matches, WORKER=true.
+        required: false
+        type: string
+        default: ""
+
+      backend_path_pattern:
+        description: >
+          grep -E pattern matching files that belong to the backend service.
+          Applied to the changed-file list AFTER excluding worker_exclusive_path_pattern.
+          When any remaining file matches, BACKEND=true.
+        required: false
+        type: string
+        default: ""
+
+      worker_exclusive_path_pattern:
+        description: >
+          grep -E pattern matching files that are ONLY used by the worker
+          (not the backend). These are excluded before testing backend_path_pattern
+          so that a pure worker change does not trigger a backend redeploy.
+          Leave empty to apply backend_path_pattern to the full file list.
+        required: false
+        type: string
+        default: ""
+
+    secrets:
+      infra_token:
+        description: >
+          Token with read access to infra_repo.
+          Use a fine-grained PAT scoped to the infra repo (repo scope only).
+          persist-credentials is false so the token does not leak into git config.
+        required: true
+
+# One deploy per environment at a time.
+# cancel-in-progress: false is MANDATORY with Terraform: two concurrent applies
+# compete for the S3 state lock and one will fail mid-apply, potentially leaving
+# resources in an inconsistent state. A queued deploy waits instead of canceling.
+# The rollout is waited on by Terraform (wait_for_steady_state), not by
+# aws-actions/amazon-ecs-deploy-task-definition. That action is gone, and with
+# it the false-red failures documented in 77447df: its AWS SDK v2
+# `servicesStable` waiter reported "Resource is not in the state servicesStable"
+# at 18s and 37s on services that reached steady state moments later, and it
+# exposed no way to delay its first poll. The workaround was a 30s sleep before
+# each deploy step; it is not carried over because the waiter it worked around
+# no longer runs. Three occurrences on 2026-08-27, plus four re-runs of the same
+# commit that night — see that commit for the full ruling-out of timeout,
+# draining, stale deployments and blue/green.
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  ENV_NAME:     ${{ inputs.environment }}
+  ECR_REGISTRY: ${{ inputs.ecr_account_id }}.dkr.ecr.${{ inputs.aws_region }}.amazonaws.com
+  ECR_REPO:     ${{ inputs.ecr_repository }}
+  TF_VERSION:   ${{ inputs.tf_version }}
+  TG_VERSION:   ${{ inputs.tg_version }}
+
+jobs:
+  # Decide which stack(s) to deploy.
+  #   - workflow_dispatch / workflow_call (trigger != workflow_run): honour the
+  #     `target` input and look up the stack array in service_stack_map.
+  #   - workflow_run (auto dev): diff the built commit against its parent and
+  #     map changed paths to one of auto_backend_stacks / auto_worker_stacks /
+  #     auto_both_stacks. compute always precedes queue-worker and voiceai-ws
+  #     because those inherit container_image from the compute dependency in
+  #     Terragrunt state.
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      stacks:    ${{ steps.decide.outputs.stacks }}
+      image_tag: ${{ steps.resolve_tag.outputs.tag }}
+    steps:
+      # Protected environments (prod/staging) must NEVER deploy a moving tag.
+      # `latest-dev` is overwritten by every dev push, so deploying it to prod
+      # ships whatever dev built last (root cause of the DEVSYM-408 prod
+      # incident). Require an immutable tag: the vX.Y.Z tag from a GitHub
+      # release, a dev-<short-sha> build tag, or an explicit sha256 digest.
+      - name: Enforce immutable image tag for protected environments
+        if: inputs.environment == 'prod' || inputs.environment == 'staging'
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          if [[ "$TAG" =~ ^[0-9]{14}-[a-z0-9._-]+$ ]] || \
+             [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+             [[ "$TAG" =~ ^sha256:[0-9a-f]{64}$ ]] || \
+             [[ "$TAG" =~ ^dev-[0-9a-f]{7,}$ ]]; then
+            echo "OK: '$TAG' is an immutable tag for '${{ inputs.environment }}'."
+          else
+            echo "::error::Refusing to deploy moving tag '$TAG' to '${{ inputs.environment }}'." \
+              "Protected environments require an immutable image tag — a vX.Y.Z release tag" \
+              "(e.g. v1.0.6), a dev-<sha> build tag (e.g. dev-abc1234)," \
+              "a YYYYMMDDHHMMSS-<suffix> tag, or a sha256:<digest> — never latest-dev/latest."
+            exit 1
+          fi
+
+      # Resolve IMAGE_TAG: download artifact from the triggering build run (auto
+      # dev path), or use the explicit input (workflow_dispatch / workflow_call).
+      #
+      # github.event mirrors the caller's event inside a reusable workflow, so
+      # github.event.workflow_run.id is the build run that triggered the caller.
+      - name: Download image-tag artifact (workflow_run trigger)
+        if: inputs.trigger == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: image-tag
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tag
+        id: resolve_tag
+        run: |
+          if [ "${{ inputs.trigger }}" = "workflow_run" ]; then
+            TAG=$(cat image-tag.txt)
+          else
+            TAG="${{ inputs.image_tag }}"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::No image tag available. For auto dev deploys the build workflow" \
+              "must publish an image-tag artifact. For manual triggers, pass image_tag."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved image tag: $TAG"
+
+      # fetch-depth: 2 is required for the git diff in the auto dev path.
+      # The ref for workflow_run is the head SHA of the built commit; for all
+      # other triggers it is the caller's current SHA.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          ref: ${{ inputs.trigger == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - id: decide
+        run: |
+          set -euo pipefail
+
+          TRIGGER="${{ inputs.trigger }}"
+
+          if [ "$TRIGGER" != "workflow_run" ]; then
+            TARGET="${{ inputs.target }}"
+            TARGET="${TARGET:-all}"
+
+            # Look up the target in the service_stack_map JSON.
+            # compute must always precede queue-worker and voiceai-ws because those
+            # inherit container_image from the compute dependency in Terragrunt state.
+            # ai-service (compute-ai) is independent and reachable only via this path.
+            STACKS=$(printf '%s' '${{ inputs.service_stack_map }}' \
+              | jq -c --arg t "$TARGET" '.[$t] // empty')
+            if [ -z "$STACKS" ]; then
+              echo "::error::Unknown target '$TARGET'." \
+                "Available targets: $(printf '%s' '${{ inputs.service_stack_map }}' | jq -r 'keys | join(", ")')"
+              exit 1
+            fi
+            echo "stacks=$STACKS" >> "$GITHUB_OUTPUT"
+            echo "Manual/call dispatch → target=$TARGET stacks=$STACKS"
+            exit 0
+          fi
+
+          # Auto dev deploy: what changed in the built commit?
+          FILES="$(git diff --name-only HEAD~1 HEAD || true)"
+          echo "Changed files:"; echo "$FILES"
+
+          BACKEND=false
+          WORKER=false
+
+          WORKER_PATTERN="${{ inputs.worker_path_pattern }}"
+          BACKEND_PATTERN="${{ inputs.backend_path_pattern }}"
+          WORKER_EXCLUSIVE="${{ inputs.worker_exclusive_path_pattern }}"
+
+          # --- Worker path detection ---
+          if [ -n "$WORKER_PATTERN" ] && echo "$FILES" | grep -qE "$WORKER_PATTERN"; then
+            WORKER=true
+          fi
+
+          # --- Backend path detection (excluding worker-exclusive entrypoints) ---
+          # Excluding worker-exclusive paths prevents a pure worker change from
+          # triggering an unnecessary backend redeploy.
+          if [ -n "$WORKER_EXCLUSIVE" ]; then
+            NONWORKER="$(echo "$FILES" | grep -vE "$WORKER_EXCLUSIVE" || true)"
+          else
+            NONWORKER="$FILES"
+          fi
+          if [ -n "$BACKEND_PATTERN" ] && echo "$NONWORKER" | grep -qE "$BACKEND_PATTERN"; then
+            BACKEND=true
+          fi
+
+          # Safety net: image was rebuilt but nothing mapped (e.g. docs-only) →
+          # keep the legacy behaviour of refreshing the backend.
+          if [ "$BACKEND" = "false" ] && [ "$WORKER" = "false" ]; then
+            BACKEND=true
+          fi
+
+          # Select the pre-configured stack array for this combination.
+          if [ "$BACKEND" = "true" ] && [ "$WORKER" = "true" ]; then
+            STACKS='${{ inputs.auto_both_stacks }}'
+          elif [ "$BACKEND" = "true" ]; then
+            STACKS='${{ inputs.auto_backend_stacks }}'
+          else
+            STACKS='${{ inputs.auto_worker_stacks }}'
+          fi
+
+          if [ -z "$STACKS" ] || [ "$STACKS" = "[]" ]; then
+            echo "::error::Auto-deploy stacks not configured for backend=$BACKEND worker=$WORKER." \
+              "Set auto_backend_stacks, auto_worker_stacks, and auto_both_stacks inputs."
+            exit 1
+          fi
+
+          echo "Auto deploy → backend=$BACKEND worker=$WORKER stacks=$STACKS"
+          echo "stacks=$STACKS" >> "$GITHUB_OUTPUT"
+
+  # Deploy each Terragrunt stack in order (max-parallel: 1 serialises the matrix).
+  # compute always runs first — queue-worker and voiceai-ws inherit container_image
+  # from its Terragrunt state output. Terraform itself runs the database migration
+  # (terraform_data.migrate in modules/root/compute) before updating the ECS service,
+  # and wait_for_steady_state = true replaces the old aws ecs wait services-stable.
+  deploy:
+    needs: detect
+    if: needs.detect.result == 'success'
+    name: Deploy ${{ matrix.stack }} to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        stack: ${{ fromJson(needs.detect.outputs.stacks) }}
+      max-parallel: 1
+    env:
+      IMAGE_TAG: ${{ needs.detect.outputs.image_tag }}
+
+    steps:
+      # Checkout the infra repo to run Terragrunt.
+      # SETUP REQUIRED: store a token with read access to the infra repo as the
+      # INFRA_TOKEN secret. Scope it to `repo` on a fine-grained token limited
+      # to that repo — it only needs to clone.
+      # persist-credentials: false keeps the token out of the checkout's git config.
+      - name: Checkout infra repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.infra_repo }}
+          token: ${{ secrets.infra_token }}
+          path: infra
+          persist-credentials: false
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Set up Terragrunt
+        uses: autero1/action-terragrunt@v3
+        with:
+          terragrunt_version: ${{ env.TG_VERSION }}
+
+      - name: Configure AWS credentials (OIDC — ECR entry role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.oidc_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Assume deploy role (cross-account)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+          role-chaining: true
+
+      - name: Apply ${{ matrix.stack }} stack
+        working-directory: infra/${{ inputs.infra_base_path }}/${{ env.ENV_NAME }}/${{ matrix.stack }}
+        env:
+          CONTAINER_IMAGE_TAG: ${{ env.IMAGE_TAG }}
+        run: terragrunt apply --non-interactive --auto-approve
+
+      - name: Summary
+        run: |
+          echo "### Deployed \`${{ matrix.stack }}\` to \`${{ env.ENV_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** \`${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Stack:** \`${{ inputs.infra_base_path }}/${{ env.ENV_NAME }}/${{ matrix.stack }}\`" >> $GITHUB_STEP_SUMMARY

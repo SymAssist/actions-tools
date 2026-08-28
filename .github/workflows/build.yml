@@ -1,0 +1,169 @@
+name: Build and Push (Reusable)
+
+# Reusable build workflow: builds a Docker image, pushes it to ECR, and
+# publishes the resolved tag as an artifact and a workflow output.
+#
+# Callers pass all AWS and service-specific values as inputs; no
+# SymAssist-specific value is hardcoded here. The workflow is safe to
+# make public: it contains no account IDs, ARNs, or repo names.
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        description: AWS region for ECR (e.g. us-east-1)
+        required: false
+        type: string
+        default: us-east-1
+
+      ecr_account_id:
+        description: AWS account ID that hosts the ECR registry
+        required: true
+        type: string
+
+      oidc_role_arn:
+        description: IAM role ARN to assume via OIDC for ECR access
+        required: true
+        type: string
+
+      ecr_repository:
+        description: ECR repository name (e.g. myapp, myapp-ai)
+        required: true
+        type: string
+
+      # Non-release tag prefix. The generated tag for push/dispatch events is
+      # "<tag_prefix>-<short-sha>" (e.g. "dev-abc1234"). Release events always
+      # produce the release tag name (vX.Y.Z) regardless of this value.
+      tag_prefix:
+        description: Prefix for non-release image tags (result is "<prefix>-<sha>")
+        required: false
+        type: string
+        default: dev
+
+      build_context:
+        description: Docker build context path
+        required: false
+        type: string
+        default: .
+
+      dockerfile:
+        description: Path to the Dockerfile (relative to build_context)
+        required: false
+        type: string
+        default: Dockerfile
+
+    outputs:
+      image_tag:
+        description: The image tag that was built or reused (e.g. v1.2.3 or dev-abc1234)
+        value: ${{ jobs.build-and-push.outputs.image_tag }}
+
+# One build per ref at a time; a newer push on the same branch cancels the
+# in-progress build (saving minutes and avoiding a stale image racing ahead).
+# github.ref is the caller's ref, so each calling service has its own group.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    name: Build Docker image and push to ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      image_tag: ${{ steps.tag.outputs.TAG }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.oidc_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Immutable tag strategy:
+      #   - release event  → vX.Y.Z from the published release tag (e.g. v1.2.3)
+      #   - push / workflow_dispatch → <tag_prefix>-<short-sha> (traceable to commit)
+      # The `latest-dev` mutable tag is intentionally NOT pushed: it caused the
+      # DEVSYM-408 prod incident (latest-dev was deployed to prod silently).
+      #
+      # github.event_name reflects the CALLER's event (GitHub reusable workflow
+      # contract), so the release vs. non-release check works correctly here.
+      - name: Generate image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ inputs.tag_prefix }}-$(git rev-parse --short HEAD)"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Generated tag: $TAG"
+
+      # The tag is derived from the commit, so re-running this workflow on a
+      # commit that was already built produces the same tag — and the ECR
+      # repository is immutable, so the push would be rejected. Re-running a
+      # workflow is routine, and the image already in the registry is the one
+      # this build would produce, so reuse it and skip to publishing the tag.
+      - name: Check whether this tag was already built
+        id: exists
+        run: |
+          if aws ecr describe-images \
+               --repository-name "${{ inputs.ecr_repository }}" \
+               --image-ids imageTag="${{ steps.tag.outputs.TAG }}" \
+               --region "${{ inputs.aws_region }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image ${{ inputs.ecr_repository }}:${{ steps.tag.outputs.TAG }} already exists — skipping build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.exists.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      # build-push-action handles login, multi-platform support, and GitHub
+      # Actions cache (type=gha) out of the box — faster rebuilds on partial
+      # layer hits, no manual docker build + docker push.
+      - name: Build and push to ECR
+        if: steps.exists.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ steps.tag.outputs.TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The deploy workflow downloads this artifact to resolve the exact tag
+      # without re-running the tag-generation logic.
+      - name: Write image tag artifact
+        run: echo "${{ steps.tag.outputs.TAG }}" > image-tag.txt
+
+      - name: Upload image-tag artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tag
+          path: image-tag.txt
+          retention-days: 7
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.exists.outputs.exists }}" = "true" ]; then
+            echo "### Image reused (already in ECR)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Image pushed to ECR" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- **Tag:** \`${{ steps.tag.outputs.TAG }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Registry:** \`${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}\`" >> $GITHUB_STEP_SUMMARY
