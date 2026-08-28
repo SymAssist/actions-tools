@@ -38,10 +38,12 @@ on:
         required: true
         type: string
 
-    # INFRA_TOKEN is not declared here on purpose. Callers pass secrets with
-    # `inherit`, which carries them by their own name, and a manual dispatch
-    # reads it from this repository. Declaring it would force every caller in
-    # the chain to redeclare and forward it by hand.
+    secrets:
+      INFRA_TOKEN:
+        description: >
+          Read access to the infra repository, cloned before terragrunt runs.
+          A manual dispatch reads it from this repository instead.
+        required: false
 
   workflow_dispatch:
     inputs:

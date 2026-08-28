@@ -72,6 +72,14 @@ on:
         required: true
         type: string
 
+    secrets:
+      INFRA_TOKEN:
+        description: >
+          Read access to the infra repository, forwarded to the deploy this
+          build chains into. Declared and passed by name rather than inherited:
+          `inherit` does not reach a workflow two levels down.
+        required: false
+
     outputs:
       image_tag:
         description: The image tag that was built or reused (e.g. v1.2.3 or dev-abc1234)
@@ -214,4 +222,5 @@ jobs:
       environment: dev
       image_tag: ${{ needs.build-and-push.outputs.image_tag }}
       target: ${{ inputs.auto_deploy_target }}
-    secrets: inherit
+    secrets:
+      INFRA_TOKEN: ${{ secrets.INFRA_TOKEN }}
