@@ -73,6 +73,13 @@ on:
           - ai-service
           - all
 
+# Needed for the manual path. When the build calls this workflow it passes the
+# permission down to the job, but a workflow_dispatch has no caller to inherit
+# from — the run reached AWS with no token and failed to load credentials.
+permissions:
+  id-token: write
+  contents: read
+
 # One deploy per environment at a time.
 # cancel-in-progress: false is MANDATORY with Terraform: two concurrent applies
 # compete for the S3 state lock and one will fail mid-apply, potentially leaving
