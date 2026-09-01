@@ -85,12 +85,16 @@ on:
         description: The image tag that was built or reused (e.g. v1.2.3 or dev-abc1234)
         value: ${{ jobs.build-and-push.outputs.image_tag }}
 
-# One build per ref at a time; a newer push on the same branch cancels the
-# in-progress build (saving minutes and avoiding a stale image racing ahead).
+# One build per ref at a time, and a newer push WAITS rather than cancelling.
+# The deploy runs as a job inside this workflow, so cancelling the build kills
+# the deploy with it — including a terragrunt apply in flight, which leaves the
+# state locked and needs a manual unlock. That happened: a merge cancelled the
+# previous one mid-apply and left dev/voiceai-ws locked by a runner that no
+# longer existed. Queueing costs runner minutes; cancelling costs an unlock.
 # github.ref is the caller's ref, so each calling service has its own group.
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build-and-push:
@@ -173,6 +177,13 @@ jobs:
           tags: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ steps.tag.outputs.TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Without these, buildx publishes a manifest list plus a provenance
+          # attestation, so every build leaves three entries in the registry
+          # instead of one. Nothing reads that metadata here: the image is
+          # already traceable through its commit-derived tag, and the registry
+          # has no vulnerability scanning to consume an SBOM.
+          provenance: false
+          sbom: false
 
       # The deploy workflow downloads this artifact to resolve the exact tag
       # without re-running the tag-generation logic.
