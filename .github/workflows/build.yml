@@ -171,9 +171,23 @@ jobs:
           node-version: ${{ inputs.node_version }}
           cache: pnpm
 
+      # ALL_VARS / ALL_SECRETS expose this job's `vars` and `secrets` contexts to
+      # the script. They cannot come from the caller: an expression written into
+      # the pre_build_run input is evaluated in the CALLER's context, and a job
+      # that calls a reusable workflow cannot declare an environment, so it
+      # would resolve to nothing. Evaluated here they carry the environment
+      # declared on this job.
+      #
+      # These are the calling repository's OWN vars and secrets — the same ones
+      # its workflows can already read — so exposing them to its own pre-build
+      # script grants no access it did not already have. As JSON blobs they are
+      # still masked in logs.
       - name: Run pre-build commands
         if: inputs.pre_build_run != ''
         working-directory: ${{ inputs.build_context }}
+        env:
+          ALL_VARS: ${{ toJSON(vars) }}
+          ALL_SECRETS: ${{ toJSON(secrets) }}
         run: ${{ inputs.pre_build_run }}
 
       - name: Configure AWS credentials
