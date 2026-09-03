@@ -33,7 +33,7 @@ on:
         description: >
           Which service(s) to deploy. Must be one of the keys in the internal
           service-stack map: backend-api | backend-queue-worker |
-          voiceai-websocket | backend-all | ai-service | all.
+          voiceai-websocket | backend-all | ai-service | frontend | all.
           No default: the caller states what it is deploying.
         required: true
         type: string
@@ -71,6 +71,7 @@ on:
           - backend-queue-worker
           - voiceai-websocket
           - ai-service
+          - frontend
           - all
 
 # Needed for the manual path. When the build calls this workflow it passes the
@@ -164,10 +165,26 @@ jobs:
             voiceai-websocket)    STACKS='["compute","voiceai-ws"]' ;;
             backend-all)          STACKS='["compute","queue-worker","voiceai-ws"]' ;;
             ai-service)           STACKS='["compute-ai"]' ;;
+            frontend)
+              # Only production serves the frontend from ECS. Dev and stage are
+              # a Vite bundle on S3 + CloudFront (the `static` stack), deployed
+              # by the frontend repository's own workflow — there is no
+              # compute-frontend stack outside prod, so without this guard the
+              # apply would fail on a missing directory.
+              if [ "$ENV_NAME" != "prod" ]; then
+                echo "::error::target 'frontend' is only valid for environment 'prod'." \
+                  "Dev and stage deploy the frontend to S3 + CloudFront from its own repository."
+                exit 1
+              fi
+              STACKS='["compute-frontend"]'
+              ;;
+            # Deliberately excludes compute-frontend: the frontend image lives in
+            # a different registry and its tag format is its own, so a single
+            # image_tag cannot be valid for it and the backend at the same time.
             all)                  STACKS='["compute","queue-worker","voiceai-ws","compute-ai"]' ;;
             *)
               echo "::error::Unknown target '$TARGET'." \
-                "Available targets: backend-api, backend-queue-worker, voiceai-websocket, backend-all, ai-service, all"
+                "Available targets: backend-api, backend-queue-worker, voiceai-websocket, backend-all, ai-service, frontend, all"
               exit 1
               ;;
           esac

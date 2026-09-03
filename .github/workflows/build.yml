@@ -57,6 +57,46 @@ on:
         type: string
         default: Dockerfile
 
+      # Deployment environment whose vars and secrets this build can read.
+      # Only needed by services whose image bakes configuration at build time —
+      # the frontend compiles VITE_* values into the bundle, so it must build
+      # against the target environment's variables.
+      #
+      # A reusable workflow CANNOT receive environment secrets from its caller:
+      # `on.workflow_call` does not support the `environment` keyword, so
+      # `secrets: inherit` carries repository and organization secrets only.
+      # Declaring the environment on the job below is the only way to reach
+      # them. They resolve against the CALLING repository, so the values stay
+      # where they belong and nothing is duplicated here.
+      #
+      # Backend and AI Service leave this empty: their images are
+      # environment-agnostic and take configuration from the task definition.
+      environment:
+        description: GitHub environment whose vars/secrets the build can read
+        required: false
+        type: string
+        default: ""
+
+      # Commands run after checkout and before the Docker build, in the build
+      # context. For an image that packages an already-compiled artifact rather
+      # than compiling inside the Dockerfile — the frontend ships a prebuilt
+      # `dist/` so that VITE_* values never land in the image history as build
+      # args — this is where that compilation happens.
+      pre_build_run:
+        description: Shell commands to run before the Docker build
+        required: false
+        type: string
+        default: ""
+
+      # Sets up Node before pre_build_run. Left empty, no Node setup runs and
+      # whatever the runner image ships is used. Pinning it here keeps the
+      # build independent of runner image changes.
+      node_version:
+        description: Node version to set up before pre_build_run (empty = skip)
+        required: false
+        type: string
+        default: ""
+
       # Target passed to the automatic dev deploy. Selects which Terragrunt
       # stacks to apply after a push to the dev branch.
       # Defaults to backend-queue-worker (compute + queue-worker), the stacks
@@ -102,6 +142,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    # Resolves against the CALLING repository's environments. Empty for callers
+    # that do not need environment-scoped values, which is the default.
+    environment: ${{ inputs.environment }}
+
     permissions:
       id-token: write
       contents: read
@@ -112,6 +156,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # ---- Optional pre-build ------------------------------------------------
+      # Runs before any AWS credential is assumed: a failing compile should stop
+      # the build without having touched the registry.
+      - name: Setup pnpm
+        if: inputs.node_version != ''
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        if: inputs.node_version != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: pnpm
+
+      - name: Run pre-build commands
+        if: inputs.pre_build_run != ''
+        working-directory: ${{ inputs.build_context }}
+        run: ${{ inputs.pre_build_run }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
