@@ -247,11 +247,100 @@ jobs:
           role-to-assume: ${{ vars.OIDC_ROLE_ARN }}
           aws-region: us-east-1
 
+      # Recorded before the apply so the cleanup below can tell a lock this run
+      # created from one that was already held by someone else.
+      - name: Mark apply start
+        id: apply_start
+        run: echo "at=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+
       - name: Apply ${{ matrix.stack }} stack
         working-directory: infra/${{ env.INFRA_BASE_PATH }}/${{ env.ENV_NAME }}/${{ matrix.stack }}
         env:
           CONTAINER_IMAGE_TAG: ${{ inputs.image_tag }}
-        run: terragrunt apply --non-interactive --auto-approve
+        # -lock-timeout: wait for a lock held by another run instead of failing
+        # on contention. Runs already queue (see the concurrency group above), so
+        # this only covers the overlap while one finishes and the next starts.
+        run: terragrunt apply --non-interactive --auto-approve -lock-timeout=5m
+
+      # A cancelled or crashed apply leaves the state lock held, and every later
+      # run on that stack fails until someone unlocks it by hand.
+      #
+      # This releases ONLY a lock this run created. Unlocking blindly would break
+      # a concurrent apply that legitimately holds it, which is worse than the
+      # problem being fixed: a stuck lock blocks deploys, a wrongly released one
+      # corrupts state. When ownership cannot be proven the lock is left alone and
+      # reported, and the runbook covers releasing it by hand.
+      - name: Release the state lock if this run left it held
+        if: cancelled() || failure()
+        env:
+          STACK: ${{ matrix.stack }}
+          STARTED_AT: ${{ steps.apply_start.outputs.at }}
+        run: |
+          set -uo pipefail
+
+          ENV_HCL="infra/${{ env.INFRA_BASE_PATH }}/${{ env.ENV_NAME }}/env.hcl"
+          if [ ! -f "$ENV_HCL" ]; then
+            echo "No $ENV_HCL — the infra checkout never happened, so no apply ran."
+            exit 0
+          fi
+
+          # Read from infra rather than hardcoding: these values live there and
+          # would drift if duplicated here.
+          BUCKET=$(sed -n 's/.*tfstate_bucket[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ENV_HCL" | head -1)
+          TABLE=$(sed -n 's/.*tfstate_lock_table[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ENV_HCL" | head -1)
+          if [ -z "$BUCKET" ] || [ -z "$TABLE" ]; then
+            echo "::warning::Could not read the state backend from $ENV_HCL — skipping lock cleanup."
+            exit 0
+          fi
+
+          # Matches the backend key: "${path_relative_to_include()}/terraform.tfstate".
+          LOCK_ID="$BUCKET/${{ env.ENV_NAME }}/$STACK/terraform.tfstate"
+          echo "Looking for a held lock on $LOCK_ID"
+
+          ITEM=$(aws dynamodb get-item \
+            --table-name "$TABLE" \
+            --key "{\"LockID\":{\"S\":\"$LOCK_ID\"}}" \
+            --query 'Item.Info.S' --output text 2>/dev/null || echo "None")
+
+          if [ -z "$ITEM" ] || [ "$ITEM" = "None" ]; then
+            echo "No lock held. Nothing to release."
+            exit 0
+          fi
+
+          echo "$ITEM" > /tmp/lockinfo.json
+          LOCK_UUID=$(python3 -c "import json;print(json.load(open('/tmp/lockinfo.json')).get('ID',''))")
+          LOCK_WHO=$(python3 -c "import json;print(json.load(open('/tmp/lockinfo.json')).get('Who',''))")
+          LOCK_CREATED=$(python3 -c "
+          import json,datetime
+          c=json.load(open('/tmp/lockinfo.json')).get('Created','')
+          try:
+              print(int(datetime.datetime.fromisoformat(c.replace('Z','+00:00')).timestamp()))
+          except Exception:
+              print(0)")
+
+          echo "Held by '$LOCK_WHO', created at $LOCK_CREATED, this run started at $STARTED_AT"
+
+          # Ownership test: a lock created before this run's apply belongs to
+          # someone else. Timestamps are the reliable signal — `Who` is
+          # runner@<hostname> and two runners can collide.
+          if [ "$LOCK_CREATED" -lt "$STARTED_AT" ] 2>/dev/null; then
+            echo "::warning::Lock on $STACK predates this run — leaving it alone. Release it with the runbook in Braintly/infra/docs/runbook-terraform-state-lock.md"
+            {
+              echo "### Lock left in place on \`$STACK\`"
+              echo "It was already held when this run started (\`$LOCK_WHO\`), so releasing it could break another apply."
+              echo "Lock ID: \`$LOCK_UUID\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "The lock was created by this run — releasing it."
+          cd "infra/${{ env.INFRA_BASE_PATH }}/${{ env.ENV_NAME }}/$STACK"
+          if terragrunt force-unlock -force "$LOCK_UUID"; then
+            echo "Released lock $LOCK_UUID on $STACK."
+            echo "### Released the state lock on \`$STACK\` left by this run" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::force-unlock failed for $LOCK_UUID on $STACK. Release it with the runbook."
+          fi
 
       - name: Summary
         run: |
