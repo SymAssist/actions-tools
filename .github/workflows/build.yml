@@ -88,6 +88,18 @@ on:
         type: string
         default: ""
 
+      # Secrets Manager secret holding build-time configuration as a flat JSON
+      # object, merged into the pre-build's ALL_SECRETS. Only consulted when
+      # `environment` is set. Empty falls back to `symassist-{environment}-build-env`,
+      # which is what lets a caller pinned to a release tag pick this up without
+      # being edited. The entry role needs GetSecretValue on it — see
+      # `build_secret_arns` in Braintly/infra's github-oidc module.
+      build_secret_id:
+        description: Secrets Manager secret id with build-time config (empty = conventional name)
+        required: false
+        type: string
+        default: ""
+
       # Sets up Node before pre_build_run. Left empty, no Node setup runs and
       # whatever the runner image ships is used. Pinning it here keeps the
       # build independent of runner image changes.
@@ -171,6 +183,72 @@ jobs:
           node-version: ${{ inputs.node_version }}
           cache: pnpm
 
+      # Moved ahead of the pre-build: the step below needs credentials to read
+      # build-time configuration from Secrets Manager. Nothing is pushed here —
+      # the registry is still only touched after the compile succeeds.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.oidc_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      # Build-time secrets for images that bake configuration in.
+      #
+      # A reusable workflow cannot reach the caller's secrets. `on.workflow_call`
+      # exposes only what the caller passes by name, `secrets: inherit` does not
+      # cross organisations, and a job that calls a reusable workflow cannot
+      # declare an environment — so environment secrets never arrive either.
+      # Measured on SymAssist-Frontend run 34852403285: the caller's environment
+      # VARIABLES came through in full while the `secrets` context held nothing
+      # but `github_token`, not even the INFRA_TOKEN this workflow declares.
+      #
+      # Variables are not an option for anything sensitive: the runner prints
+      # every `env:` value of a step into the log, and vars are not masked.
+      #
+      # So the values come from Secrets Manager, where they already live — the
+      # frontend's chat API key is the same secret the AI Service reads as
+      # API_KEY. One source of truth rather than a copy in GitHub that drifts.
+      #
+      # The secret holds a flat JSON object. Its name defaults to
+      # `symassist-{environment}-build-env` so a caller pinned to a release tag
+      # needs no change; `build_secret_id` overrides it. Absent or unreadable,
+      # the step is a no-op and the pre-build falls back to the `secrets`
+      # context — callers that do not bake configuration (backend, AI Service)
+      # pass no `environment` and never run this at all.
+      - name: Load build-time secrets
+        id: build_env
+        if: inputs.environment != '' && inputs.pre_build_run != ''
+        env:
+          SECRET_ID: ${{ inputs.build_secret_id != '' && inputs.build_secret_id || format('symassist-{0}-build-env', inputs.environment) }}
+        run: |
+          set -uo pipefail
+
+          JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "$SECRET_ID" \
+            --query SecretString --output text 2>/dev/null) || {
+            echo "No build-env secret named '$SECRET_ID' — falling back to the secrets context."
+            exit 0
+          }
+
+          if ! echo "$JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            echo "::error::$SECRET_ID is not a flat JSON object."
+            exit 1
+          fi
+
+          # Mask before anything can echo them: a value read at runtime is not
+          # registered as a secret, so the runner would otherwise print it.
+          echo "$JSON" | jq -r '.[] | select(. != null and . != "")' \
+            | while IFS= read -r value; do echo "::add-mask::$value"; done
+
+          echo "Keys loaded from $SECRET_ID:"
+          echo "$JSON" | jq -r 'keys[]' | sed 's/^/  /'
+
+          {
+            echo "BUILD_SECRETS<<__EOF__"
+            echo "$JSON"
+            echo "__EOF__"
+          } >> "$GITHUB_ENV"
+
       # ALL_VARS / ALL_SECRETS expose this job's `vars` and `secrets` contexts to
       # the script. They cannot come from the caller: an expression written into
       # the pre_build_run input is evaluated in the CALLER's context, and a job
@@ -178,23 +256,16 @@ jobs:
       # would resolve to nothing. Evaluated here they carry the environment
       # declared on this job.
       #
-      # These are the calling repository's OWN vars and secrets — the same ones
-      # its workflows can already read — so exposing them to its own pre-build
-      # script grants no access it did not already have. As JSON blobs they are
-      # still masked in logs.
+      # ALL_SECRETS prefers the Secrets Manager payload when the step above found
+      # one, and falls back to the `secrets` context otherwise — which is what
+      # every caller that does not bake configuration keeps using.
       - name: Run pre-build commands
         if: inputs.pre_build_run != ''
         working-directory: ${{ inputs.build_context }}
         env:
           ALL_VARS: ${{ toJSON(vars) }}
-          ALL_SECRETS: ${{ toJSON(secrets) }}
+          ALL_SECRETS: ${{ env.BUILD_SECRETS || toJSON(secrets) }}
         run: ${{ inputs.pre_build_run }}
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ inputs.oidc_role_arn }}
-          aws-region: ${{ inputs.aws_region }}
 
       - name: Login to Amazon ECR
         id: login-ecr
