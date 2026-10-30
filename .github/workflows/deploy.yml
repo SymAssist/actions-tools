@@ -157,13 +157,13 @@ jobs:
           TARGET="${TARGET:-all}"
 
           # Service-to-stack map. Apply order matters: compute must precede
-          # queue-worker and voiceai-ws because those inherit container_image
+          # queue-worker, voiceai-ws and scheduler because those inherit container_image
           # from the compute Terragrunt state output. compute-ai is independent.
           case "$TARGET" in
             backend-api)          STACKS='["compute"]' ;;
             backend-queue-worker) STACKS='["compute","queue-worker"]' ;;
             voiceai-websocket)    STACKS='["compute","voiceai-ws"]' ;;
-            backend-all)          STACKS='["compute","queue-worker","voiceai-ws"]' ;;
+            backend-all)          STACKS='["compute","queue-worker","voiceai-ws","scheduler"]' ;;
             ai-service)           STACKS='["compute-ai"]' ;;
             frontend)
               # Only production serves the frontend from ECS. Dev and stage are
@@ -181,7 +181,7 @@ jobs:
             # Deliberately excludes compute-frontend: the frontend image lives in
             # a different registry and its tag format is its own, so a single
             # image_tag cannot be valid for it and the backend at the same time.
-            all)                  STACKS='["compute","queue-worker","voiceai-ws","compute-ai"]' ;;
+            all)                  STACKS='["compute","queue-worker","voiceai-ws","scheduler","compute-ai"]' ;;
             *)
               echo "::error::Unknown target '$TARGET'." \
                 "Available targets: backend-api, backend-queue-worker, voiceai-websocket, backend-all, ai-service, frontend, all"
@@ -193,7 +193,7 @@ jobs:
           echo "Target '$TARGET' -> stacks $STACKS"
 
   # Deploy each Terragrunt stack in order (max-parallel: 1 serialises the matrix).
-  # compute always runs first — queue-worker and voiceai-ws inherit container_image
+  # compute always runs first — queue-worker, voiceai-ws and scheduler inherit container_image
   # from its Terragrunt state output. Terraform itself runs the database migration
   # (terraform_data.migrate in modules/root/compute) before updating the ECS service,
   # and wait_for_steady_state = true replaces the old aws ecs wait services-stable.
